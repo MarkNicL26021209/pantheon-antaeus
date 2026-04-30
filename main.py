@@ -104,22 +104,7 @@ def get_price_history(pair):
         if not conn: return None
         cur = conn.cursor()
 
-        # Try to get recent prices from market_archives
-        cur.execute("""
-            SELECT price, timestamp
-            FROM market_archives
-            WHERE pair = %s
-            AND timestamp > NOW() - INTERVAL '4 hours'
-            ORDER BY timestamp ASC
-        """, (pair,))
-        rows = cur.fetchall()
-
-        if rows and len(rows) >= 10:
-            cur.close()
-            conn.close()
-            return [(float(r[0]), r[1]) for r in rows]
-
-        # Fallback — use signal_attribution price data
+        # Use signal_attribution trade prices as primary source
         cur.execute("""
             SELECT ofi_at_entry, trade_timestamp
             FROM signal_attribution
@@ -128,11 +113,25 @@ def get_price_history(pair):
             ORDER BY trade_timestamp ASC
         """, (pair,))
         rows = cur.fetchall()
+
+        if rows and len(rows) >= 3:
+            cur.close()
+            conn.close()
+            return [(float(r[0]), r[1]) for r in rows]
+
+        # Fallback — reconstruct from macro_state BTC price + pct changes
+        cur.execute("""
+            SELECT btc_price, timestamp
+            FROM macro_state
+            WHERE timestamp > NOW() - INTERVAL '4 hours'
+            ORDER BY timestamp ASC
+        """)
+        macro_rows = cur.fetchall()
         cur.close()
         conn.close()
 
-        if rows:
-            return [(float(r[0]), r[1]) for r in rows]
+        if macro_rows and pair == 'BTC':
+            return [(float(r[0]), r[1]) for r in macro_rows if r[0]]
 
         return None
 
