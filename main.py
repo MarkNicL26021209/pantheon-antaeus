@@ -1,24 +1,28 @@
-# ANTAEUS v1.0 | MEAN REVERSION SPECIALIST
+# ANTAEUS v1.1 | MEAN REVERSION SPECIALIST
 # Named after the giant who drew strength from returning to earth — his mean.
-# He was unbeatable as long as he could touch the ground.
-# Hercules defeated him by lifting him away from it.
 #
-# ANTAEUS specialises in identifying when price has strayed too far from
-# its mean and is likely to return. It distinguishes genuine reversion
-# opportunities from trend continuation moves that look oversold but aren't.
+# CHANGES FROM v1.0:
+# 1. CERBERUS HEARTBEAT — writes to service_heartbeat every 5-min cycle.
+#    CERBERUS threshold stays at 15 min.
+# 2. FLASK /health ENDPOINT — was missing entirely. Added with threading.
+# 3. LIVE OKX PRICE FEED — replaces the fragile signal_attribution / macro_state
+#    price source with direct OKX 1-minute candle fetching. ANTAEUS now produces
+#    real signals from day one without needing trade history to accumulate.
+# 4. CRONUS ON-CHAIN CONTEXT — reads mvrv_zone_flag and cycle_index_signal from
+#    macro_indicators to enhance deviation quality scoring. MVRV in buy zone
+#    boosts downside reversion conviction. Distribution zone boosts upside.
+# 5. SCHEMA SAFETY-NET — ALTER TABLE guards on all original columns.
 #
-# Key functions:
-# 1. Multi-timeframe mean calculation (5m, 15m, 1h, 4h)
-# 2. Deviation quality scoring — genuine oversold vs trend move
-# 3. Reversion probability estimation
-# 4. Mean reversion target calculation
-# 5. Integration with ARGUS — only fires in CHOP regimes
-# 6. Integration with PHEME — contrarian sentiment boosts reversion signal
-#
-# Output: antaeus_state table
-# PANTHEON reads antaeus_state for enhanced meanrev strategy decisions
+# UNCHANGED FROM v1.0:
+# - Multi-timeframe mean calculation logic (EMA)
+# - Deviation quality scoring framework
+# - Reversion probability computation
+# - ARGUS regime compatibility check
+# - PHEME contrarian boost
+# - pantheon_state writes
 
-import os, time, json, logging, requests, psycopg2
+import os, time, json, logging, requests, psycopg2, math, threading
+from flask import Flask, jsonify
 from datetime import datetime, timezone, timedelta
 
 logging.basicConfig(
@@ -31,13 +35,26 @@ TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 ANTAEUS_INTERVAL = 300  # 5 minutes
 
+# ── v1.1: service identity ────────────────────────────────────────────────────
+SERVICE_NAME    = "pantheon-antaeus"
+SERVICE_VERSION = "1.1"
+
 PAIRS = ['BTC', 'ETH', 'SOL']
 
-# Deviation thresholds
-WEAK_DEVIATION    = 0.005  # 0.5% — marginal
-MODERATE_DEVIATION = 0.010  # 1.0% — tradeable
-STRONG_DEVIATION  = 0.020  # 2.0% — high conviction
-EXTREME_DEVIATION = 0.040  # 4.0% — potential trend, not reversion
+# OKX instrument IDs for price fetching
+OKX_INST = {
+    'BTC': 'BTC-USDT-SWAP',
+    'ETH': 'ETH-USDT-SWAP',
+    'SOL': 'SOL-USDT-SWAP',
+}
+
+# Deviation thresholds (unchanged)
+WEAK_DEVIATION     = 0.005
+MODERATE_DEVIATION = 0.010
+STRONG_DEVIATION   = 0.020
+EXTREME_DEVIATION  = 0.040
+
+app = Flask(__name__)
 
 def get_db():
     try:
@@ -56,11 +73,42 @@ def tg(msg):
         )
     except: pass
 
+# ── v1.1: CERBERUS heartbeat ─────────────────────────────────────────────────
+def write_heartbeat(cycle_count=0, status="alive", last_error=None):
+    if not DATABASE_URL:
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+        cur  = conn.cursor()
+        cur.execute("""
+            INSERT INTO service_heartbeat
+            (service_name, last_heartbeat, version, status, loop_count, last_error, meta)
+            VALUES (%s, NOW(), %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (service_name) DO UPDATE SET
+                last_heartbeat = NOW(),
+                version        = EXCLUDED.version,
+                status         = EXCLUDED.status,
+                loop_count     = EXCLUDED.loop_count,
+                last_error     = EXCLUDED.last_error,
+                meta           = EXCLUDED.meta
+        """, (
+            SERVICE_NAME, SERVICE_VERSION, status,
+            cycle_count,
+            last_error[:500] if last_error else None,
+            json.dumps({})
+        ))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logging.warning(f"CERBERUS heartbeat failed: {e}")
+
 def self_heal_schema():
     try:
         conn = get_db()
         if not conn: return
         cur = conn.cursor()
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS antaeus_state (
                 id                  SERIAL PRIMARY KEY,
@@ -87,66 +135,146 @@ def self_heal_schema():
                 updated_at          TIMESTAMPTZ DEFAULT NOW()
             )
         """)
+
+        # Safety-net: all original columns
+        safety_cols = [
+            ("pair",                "TEXT DEFAULT 'BTC'"),
+            ("current_price",       "FLOAT DEFAULT 0.0"),
+            ("mean_5m",             "FLOAT DEFAULT 0.0"),
+            ("mean_15m",            "FLOAT DEFAULT 0.0"),
+            ("mean_1h",             "FLOAT DEFAULT 0.0"),
+            ("mean_4h",             "FLOAT DEFAULT 0.0"),
+            ("deviation_5m",        "FLOAT DEFAULT 0.0"),
+            ("deviation_15m",       "FLOAT DEFAULT 0.0"),
+            ("deviation_1h",        "FLOAT DEFAULT 0.0"),
+            ("deviation_4h",        "FLOAT DEFAULT 0.0"),
+            ("composite_deviation", "FLOAT DEFAULT 0.0"),
+            ("deviation_quality",   "TEXT DEFAULT 'WEAK'"),
+            ("reversion_prob",      "FLOAT DEFAULT 0.0"),
+            ("reversion_target",    "FLOAT DEFAULT 0.0"),
+            ("reversion_direction", "TEXT DEFAULT 'NONE'"),
+            ("regime_compatible",   "BOOLEAN DEFAULT FALSE"),
+            ("sentiment_boost",     "BOOLEAN DEFAULT FALSE"),
+            ("signal_strength",     "TEXT DEFAULT 'NONE'"),
+            ("detail",              "TEXT DEFAULT '{}'"),
+            ("updated_at",          "TIMESTAMPTZ DEFAULT NOW()"),
+        ]
+        for col, dtype in safety_cols:
+            try:
+                cur.execute(f"ALTER TABLE antaeus_state ADD COLUMN IF NOT EXISTS {col} {dtype}")
+            except: pass
+
         conn.commit()
         cur.close()
         conn.close()
-        logging.info("ANTAEUS v1.0 SCHEMA HEALED")
+        logging.info("ANTAEUS v1.1 SCHEMA HEALED")
     except Exception as e:
         logging.error(f"SCHEMA HEAL FAILED: {e}")
 
-def get_price_history(pair):
+# ─────────────────────────────────────────────────────────────
+# v1.1 NEW: LIVE PRICE FETCHING FROM OKX
+# ─────────────────────────────────────────────────────────────
+def fetch_okx_prices(pair, bars=250):
     """
-    Get recent price history from pantheon_state websocket data.
-    Falls back to trade_log prices if websocket data unavailable.
+    Fetch recent 1-minute candles from OKX for the given pair.
+    Returns list of (price, timestamp) tuples, oldest first.
+    Falls back to CoinGecko spot + macro_state if OKX fails.
     """
+    inst_id = OKX_INST.get(pair)
+    if not inst_id:
+        return None
+
+    try:
+        r = requests.get(
+            "https://www.okx.com/api/v5/market/candles",
+            params={"instId": inst_id, "bar": "1m", "limit": str(bars)},
+            timeout=10
+        )
+        if r.status_code == 200:
+            candles = r.json().get('data', [])
+            if candles:
+                # OKX returns newest first: [ts, open, high, low, close, vol, ...]
+                # Reverse to get oldest first, use close price (index 4)
+                prices = []
+                for c in reversed(candles):
+                    try:
+                        ts_ms = int(c[0])
+                        close = float(c[4])
+                        ts_dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                        if close > 0:
+                            prices.append((close, ts_dt))
+                    except: pass
+                if prices:
+                    logging.info(f"ANTAEUS {pair}: fetched {len(prices)} candles from OKX")
+                    return prices
+    except Exception as e:
+        logging.warning(f"ANTAEUS OKX price fetch failed for {pair}: {e}")
+
+    # Fallback: CoinGecko + macro_state
+    return fetch_price_fallback(pair)
+
+def fetch_price_fallback(pair):
+    """Fallback price source using CoinGecko + macro_state estimate."""
+    cg_ids = {'BTC': 'bitcoin', 'ETH': 'ethereum', 'SOL': 'solana'}
+    cg_id = cg_ids.get(pair)
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": cg_id, "vs_currencies": "usd"},
+            timeout=8
+        )
+        if r.status_code == 200:
+            price = float(r.json().get(cg_id, {}).get('usd', 0))
+            if price > 0:
+                # Single price point — limited usefulness but better than nothing
+                now = datetime.now(timezone.utc)
+                return [(price, now)]
+    except: pass
+    return None
+
+# ─────────────────────────────────────────────────────────────
+# v1.1 NEW: ON-CHAIN CONTEXT FROM CRONUS
+# ─────────────────────────────────────────────────────────────
+def get_onchain_context():
+    """
+    Read CRONUS on-chain signals from macro_indicators.
+    Used to enhance deviation quality scoring.
+    MVRV in buy zone = boost downside reversion conviction.
+    Distribution zone = boost upside reversion conviction.
+    """
+    ctx = {
+        'mvrv_zone':   'UNKNOWN',
+        'cycle_signal':'UNKNOWN',
+        'onchain_risk': 0.5,
+    }
     try:
         conn = get_db()
-        if not conn: return None
+        if not conn: return ctx
         cur = conn.cursor()
-
-        # Use signal_attribution trade prices as primary source
         cur.execute("""
-            SELECT ofi_at_entry, trade_timestamp
-            FROM signal_attribution
-            WHERE pair = %s
-            AND trade_timestamp > NOW() - INTERVAL '4 hours'
-            ORDER BY trade_timestamp ASC
-        """, (pair,))
-        rows = cur.fetchall()
-
-        if rows and len(rows) >= 3:
-            cur.close()
-            conn.close()
-            return [(float(r[0]), r[1]) for r in rows]
-
-        # Fallback — reconstruct from macro_state BTC price + pct changes
-        cur.execute("""
-            SELECT btc_price, timestamp
-            FROM macro_state
-            WHERE timestamp > NOW() - INTERVAL '4 hours'
-            ORDER BY timestamp ASC
+            SELECT mvrv_zone_flag, cycle_index_signal, onchain_risk_score
+            FROM macro_indicators
+            WHERE mvrv_zone_flag IS NOT NULL
+            ORDER BY timestamp DESC LIMIT 1
         """)
-        macro_rows = cur.fetchall()
+        row = cur.fetchone()
         cur.close()
         conn.close()
-
-        if macro_rows and pair == 'BTC':
-            return [(float(r[0]), r[1]) for r in macro_rows if r[0]]
-
-        return None
-
+        if row:
+            ctx['mvrv_zone']    = str(row[0]) if row[0] else 'UNKNOWN'
+            ctx['cycle_signal'] = str(row[1]) if row[1] else 'UNKNOWN'
+            ctx['onchain_risk'] = float(row[2]) if row[2] else 0.5
     except Exception as e:
-        logging.warning(f"PRICE HISTORY FAILED for {pair}: {e}")
-        return None
+        logging.debug(f"On-chain context read: {e}")
+    return ctx
 
 def get_current_context(pair):
-    """Get current price and regime context from DB."""
+    """Get current regime and sentiment context from DB."""
     try:
         conn = get_db()
         if not conn: return None
         cur = conn.cursor()
 
-        # Get latest ARGUS regime
         cur.execute("""
             SELECT dominant_regime, dominant_prob, confidence
             FROM argus_state
@@ -155,7 +283,6 @@ def get_current_context(pair):
         """, (pair,))
         argus = cur.fetchone()
 
-        # Get PHEME sentiment
         cur.execute("""
             SELECT sentiment_score, contrarian_signal,
                    retail_score, institutional_score
@@ -164,7 +291,6 @@ def get_current_context(pair):
         """)
         pheme = cur.fetchone()
 
-        # Get current BTC price from sentinel
         cur.execute("""
             SELECT btc_price_change_pct, fg_current, vix_level
             FROM sentinel_state
@@ -172,7 +298,6 @@ def get_current_context(pair):
         """)
         sentinel = cur.fetchone()
 
-        # Get macro state
         cur.execute("""
             SELECT btc_price, dma_200, above_200dma
             FROM macro_state
@@ -204,10 +329,7 @@ def get_current_context(pair):
         return None
 
 def compute_multi_timeframe_means(prices_with_time):
-    """
-    Calculate EMA means at multiple timeframes from price history.
-    Returns dict of {timeframe: mean_price}
-    """
+    """EMA means at multiple timeframes from price history. Unchanged from v1.0."""
     if not prices_with_time or len(prices_with_time) < 2:
         return {}
 
@@ -223,7 +345,6 @@ def compute_multi_timeframe_means(prices_with_time):
             e = p * k + e * (1 - k)
         return e
 
-    # Filter prices by timeframe
     def prices_in_window(minutes):
         cutoff = now - timedelta(minutes=minutes)
         filtered = [p for p, t in prices_with_time
@@ -240,27 +361,24 @@ def compute_multi_timeframe_means(prices_with_time):
     if p1h:  means['1h']  = ema(p1h,  min(50, len(p1h)))
     if p4h:  means['4h']  = ema(p4h,  min(200, len(p4h)))
 
-    # If insufficient history use available prices with different periods
     if not means:
         if len(prices) >= 4:
-            means['15m'] = ema(prices[-4:],  4)
-            means['1h']  = ema(prices,       min(20, len(prices)))
+            means['15m'] = ema(prices[-4:], 4)
+            means['1h']  = ema(prices, min(20, len(prices)))
         elif prices:
             means['1h']  = sum(prices) / len(prices)
 
     return means
 
-def compute_deviation_quality(deviation, context, pair):
+def compute_deviation_quality(deviation, context, onchain_ctx, pair):
     """
-    Score the quality of deviation — is this a genuine reversion opportunity
-    or price discovery in a new trend?
-
-    Returns: quality label, probability, details
+    Score the quality of deviation.
+    v1.1: adds on-chain context from CRONUS.
     """
     abs_dev = abs(deviation)
     details = {}
 
-    # Base quality from deviation size
+    # Base quality from deviation size (unchanged)
     if abs_dev < WEAK_DEVIATION:
         base_quality = 'INSUFFICIENT'
         base_prob    = 0.1
@@ -275,49 +393,77 @@ def compute_deviation_quality(deviation, context, pair):
         base_prob    = 0.70
     else:
         base_quality = 'EXTREME'
-        base_prob    = 0.40  # Extreme deviation may be trending, not reverting
+        base_prob    = 0.40
 
     details['base'] = base_quality
 
-    # Regime modifier — CHOP regimes favour reversion
+    # Regime modifier (unchanged)
     regime = context.get('argus_regime', 'UNKNOWN')
     if regime in ('CHOP_TIGHT', 'CHOP_WIDE'):
         base_prob += 0.15
         details['regime'] = 'CHOP_BOOST'
     elif regime in ('TREND_BULL', 'TREND_BEAR'):
-        base_prob -= 0.20  # Trending — deviation may continue
+        base_prob -= 0.20
         details['regime'] = 'TREND_PENALTY'
     elif regime == 'CRISIS':
-        base_prob -= 0.30  # Crisis — extreme moves can continue
+        base_prob -= 0.30
         details['regime'] = 'CRISIS_PENALTY'
 
-    # PHEME contrarian boost
+    # PHEME contrarian boost (unchanged)
     if context.get('pheme_contrast'):
         base_prob += 0.10
         details['pheme'] = 'CONTRARIAN_BOOST'
 
-    # Extreme retail fear with institutional neutral = reversion likely
     pheme_score = context.get('pheme_score', 0)
-    if pheme_score < -50 and deviation < 0:  # Price below mean AND extreme fear
+    if pheme_score < -50 and deviation < 0:
         base_prob += 0.10
         details['sentiment'] = 'EXTREME_FEAR_BOOST'
-    elif pheme_score > 50 and deviation > 0:  # Price above mean AND extreme greed
+    elif pheme_score > 50 and deviation > 0:
         base_prob += 0.10
         details['sentiment'] = 'EXTREME_GREED_BOOST'
 
-    # VIX modifier
+    # VIX modifier (unchanged)
     vix = context.get('vix', 20.0)
     if vix > 30:
-        base_prob -= 0.10  # High vol = less predictable reversion
+        base_prob -= 0.10
         details['vix'] = 'HIGH_VIX_PENALTY'
     elif vix < 15:
-        base_prob += 0.05  # Low vol = tight ranges, reversion reliable
+        base_prob += 0.05
         details['vix'] = 'LOW_VIX_BOOST'
 
-    # 200DMA context — below 200DMA oversold bounces more reliable
+    # 200DMA context (unchanged)
     if not context.get('above_200dma') and deviation < 0:
         base_prob += 0.05
         details['dma'] = 'BELOW_200DMA_BOOST'
+
+    # v1.1 NEW: CRONUS on-chain context
+    mvrv_zone   = onchain_ctx.get('mvrv_zone', 'UNKNOWN')
+    cycle_sig   = onchain_ctx.get('cycle_signal', 'UNKNOWN')
+    onchain_risk= onchain_ctx.get('onchain_risk', 0.5)
+
+    # MVRV zone — in historical buy zone with price below mean = strong conviction
+    if mvrv_zone == 'HISTORICAL_BUY_ZONE' and deviation < 0:
+        base_prob += 0.10
+        details['mvrv_zone'] = 'BUY_ZONE_BOOST'
+    elif mvrv_zone == 'BELOW_COST_BASIS' and deviation < 0:
+        base_prob += 0.12
+        details['mvrv_zone'] = 'BELOW_COST_EXTREME_BOOST'
+    elif mvrv_zone == 'OVERVALUED_ZONE' and deviation > 0:
+        base_prob += 0.08
+        details['mvrv_zone'] = 'OVERVALUED_SHORT_BOOST'
+
+    # Cycle signal — accumulation = boost downside reversion (buyers likely)
+    if cycle_sig in ('ACCUMULATION', 'DEEP_ACCUMULATION') and deviation < 0:
+        base_prob += 0.08
+        details['cycle'] = 'ACCUMULATION_BOOST'
+    elif cycle_sig in ('DISTRIBUTION', 'EXTREME_DISTRIBUTION') and deviation > 0:
+        base_prob += 0.08
+        details['cycle'] = 'DISTRIBUTION_BOOST'
+
+    # High onchain risk = reduce reversion confidence (could keep falling)
+    if onchain_risk > 0.7 and deviation < 0:
+        base_prob -= 0.08
+        details['onchain_risk'] = 'HIGH_RISK_PENALTY'
 
     final_prob = max(0.05, min(0.90, base_prob))
 
@@ -329,25 +475,19 @@ def compute_deviation_quality(deviation, context, pair):
     return final_quality, round(final_prob, 3), details
 
 def compute_reversion_target(current_price, means, deviation):
-    """
-    Calculate the most likely reversion target.
-    Primary target: 15m mean (fastest to revert to)
-    Secondary target: 1h mean (deeper reversion)
-    """
+    """Reversion target calculation. Unchanged from v1.0."""
     if not means: return current_price, current_price
 
-    # Primary target — 15m or shortest available mean
     primary_tf = '15m' if '15m' in means else '1h' if '1h' in means else list(means.keys())[0]
     primary_target = means[primary_tf]
 
-    # Secondary target — 1h or 4h mean
     secondary_tf = '1h' if '1h' in means else '4h' if '4h' in means else primary_tf
     secondary_target = means[secondary_tf]
 
     return round(primary_target, 2), round(secondary_target, 2)
 
 def compute_signal_strength(quality, prob, regime_compatible, deviation):
-    """Determine overall signal strength for PANTHEON consumption."""
+    """Signal strength classification. Unchanged from v1.0."""
     if not regime_compatible:
         return 'BLOCKED_REGIME'
     if quality == 'INSUFFICIENT':
@@ -361,7 +501,7 @@ def compute_signal_strength(quality, prob, regime_compatible, deviation):
     return 'NONE'
 
 def write_antaeus_state(pair, data):
-    """Write ANTAEUS assessment to DB."""
+    """Write ANTAEUS assessment to DB. Unchanged from v1.0."""
     try:
         conn = get_db()
         if not conn: return
@@ -403,27 +543,17 @@ def write_antaeus_state(pair, data):
             json.dumps(data['detail']),
         ))
 
-        # Write key signals to pantheon_state
-        cur.execute("""
-            INSERT INTO pantheon_state (key, value, updated_at)
-            VALUES (%s, %s, NOW())
-            ON CONFLICT (key) DO UPDATE SET
-                value=EXCLUDED.value, updated_at=NOW()
-        """, (f"antaeus:signal:{pair}", data['signal_strength']))
-
-        cur.execute("""
-            INSERT INTO pantheon_state (key, value, updated_at)
-            VALUES (%s, %s, NOW())
-            ON CONFLICT (key) DO UPDATE SET
-                value=EXCLUDED.value, updated_at=NOW()
-        """, (f"antaeus:prob:{pair}", str(data['reversion_prob'])))
-
-        cur.execute("""
-            INSERT INTO pantheon_state (key, value, updated_at)
-            VALUES (%s, %s, NOW())
-            ON CONFLICT (key) DO UPDATE SET
-                value=EXCLUDED.value, updated_at=NOW()
-        """, (f"antaeus:target:{pair}", str(data['primary_target'])))
+        for key, val in [
+            (f"antaeus:signal:{pair}", data['signal_strength']),
+            (f"antaeus:prob:{pair}",   str(data['reversion_prob'])),
+            (f"antaeus:target:{pair}", str(data['primary_target'])),
+        ]:
+            cur.execute("""
+                INSERT INTO pantheon_state (key, value, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (key) DO UPDATE SET
+                    value=EXCLUDED.value, updated_at=NOW()
+            """, (key, val))
 
         conn.commit()
         cur.close()
@@ -436,7 +566,6 @@ def write_antaeus_state(pair, data):
             f"target={data['primary_target']:.2f} [{data['direction']}]"
         )
 
-        # Telegram on strong signals
         if data['signal_strength'] == 'STRONG':
             tg(
                 f"MEAN REVERSION SIGNAL\n"
@@ -451,56 +580,44 @@ def write_antaeus_state(pair, data):
     except Exception as e:
         logging.error(f"ANTAEUS WRITE FAILED: {e}")
 
-def analyse_pair(pair):
-    """Full ANTAEUS analysis for one pair."""
+def analyse_pair(pair, onchain_ctx):
+    """Full ANTAEUS analysis for one pair. v1.1: uses live OKX prices."""
     context = get_current_context(pair)
     if not context:
         logging.warning(f"ANTAEUS: no context for {pair}")
         return
 
-    # Try to get price history
-    prices = get_price_history(pair)
+    # v1.1: fetch live prices from OKX (250 1-min candles = ~4 hours)
+    prices = fetch_okx_prices(pair, bars=250)
 
-    # If no price history use BTC price from macro as single point reference
     if not prices:
-        btc_price = context.get('btc_price', 0.0)
-        if btc_price > 0 and pair == 'BTC':
-            # Use price change to estimate recent movement
-            pct_change = context.get('btc_pct', 0.0) / 100
-            estimated_prev = btc_price / (1 + pct_change) if pct_change != -1 else btc_price
-            prices = [
-                (estimated_prev, datetime.now(timezone.utc) - timedelta(hours=1)),
-                (btc_price, datetime.now(timezone.utc))
-            ]
-        else:
-            logging.info(f"ANTAEUS {pair}: insufficient price history, using macro data")
-            # Still write a neutral state so table exists
-            data = {
-                'current_price': context.get('btc_price', 0),
-                'means': {},
-                'deviations': {},
-                'composite_deviation': 0.0,
-                'quality': 'INSUFFICIENT',
-                'reversion_prob': 0.0,
-                'primary_target': 0.0,
-                'direction': 'NONE',
-                'regime_compatible': False,
-                'sentiment_boost': False,
-                'signal_strength': 'NONE',
-                'detail': {'reason': 'insufficient_price_history'},
-            }
-            write_antaeus_state(pair, data)
-            return
+        logging.warning(f"ANTAEUS {pair}: no prices available, writing neutral state")
+        data = {
+            'current_price':      0.0,
+            'means':              {},
+            'deviations':         {},
+            'composite_deviation': 0.0,
+            'quality':            'INSUFFICIENT',
+            'reversion_prob':     0.0,
+            'primary_target':     0.0,
+            'direction':          'NONE',
+            'regime_compatible':  False,
+            'sentiment_boost':    False,
+            'signal_strength':    'NONE',
+            'detail':             {'reason': 'no_price_data'},
+        }
+        write_antaeus_state(pair, data)
+        return
 
     # Compute multi-timeframe means
     means = compute_multi_timeframe_means(prices)
-    current_price = prices[-1][0] if prices else 0.0
+    current_price = prices[-1][0]
 
     if not means or current_price == 0:
         logging.warning(f"ANTAEUS {pair}: could not compute means")
         return
 
-    # Compute deviations from each mean
+    # Deviations from each mean
     deviations = {}
     for tf, mean in means.items():
         if mean > 0:
@@ -508,7 +625,7 @@ def analyse_pair(pair):
         else:
             deviations[tf] = 0.0
 
-    # Composite deviation — weighted average
+    # Composite deviation — weighted
     tf_weights = {'5m': 0.15, '15m': 0.35, '1h': 0.35, '4h': 0.15}
     weighted_dev = 0.0
     total_weight = 0.0
@@ -518,58 +635,105 @@ def analyse_pair(pair):
         total_weight += w
     composite = weighted_dev / total_weight if total_weight > 0 else 0.0
 
-    # Direction
     direction = 'LONG' if composite < 0 else 'SHORT' if composite > 0 else 'NONE'
 
-    # Regime compatibility — ANTAEUS works best in CHOP
     regime = context.get('argus_regime', 'UNKNOWN')
     regime_compatible = regime in ('CHOP_TIGHT', 'CHOP_WIDE', 'UNKNOWN')
+    sentiment_boost   = context.get('pheme_contrast', False)
 
-    # Sentiment boost from PHEME contrarian signal
-    sentiment_boost = context.get('pheme_contrast', False)
+    # v1.1: pass onchain_ctx to quality scorer
+    quality, prob, detail = compute_deviation_quality(composite, context, onchain_ctx, pair)
 
-    # Quality and probability
-    quality, prob, detail = compute_deviation_quality(composite, context, pair)
-
-    # Reversion targets
-    primary_target, secondary_target = compute_reversion_target(
-        current_price, means, composite
-    )
-
-    # Signal strength
+    primary_target, secondary_target = compute_reversion_target(current_price, means, composite)
     signal = compute_signal_strength(quality, prob, regime_compatible, composite)
 
     data = {
-        'current_price':      current_price,
-        'means':              means,
-        'deviations':         deviations,
+        'current_price':       current_price,
+        'means':               means,
+        'deviations':          deviations,
         'composite_deviation': round(composite, 6),
-        'quality':            quality,
-        'reversion_prob':     prob,
-        'primary_target':     primary_target,
-        'secondary_target':   secondary_target,
-        'direction':          direction,
-        'regime_compatible':  regime_compatible,
-        'sentiment_boost':    sentiment_boost,
-        'signal_strength':    signal,
-        'detail':             detail,
+        'quality':             quality,
+        'reversion_prob':      prob,
+        'primary_target':      primary_target,
+        'secondary_target':    secondary_target,
+        'direction':           direction,
+        'regime_compatible':   regime_compatible,
+        'sentiment_boost':     sentiment_boost,
+        'signal_strength':     signal,
+        'detail':              detail,
     }
-
     write_antaeus_state(pair, data)
 
-def run_antaeus_pulse():
-    """Main ANTAEUS pulse — analyse all pairs."""
-    logging.info("=== ANTAEUS v1.0 PULSE STARTING ===")
-
+def run_antaeus_pulse(cycle_count):
+    """Main ANTAEUS pulse."""
+    logging.info("=== ANTAEUS v1.1 PULSE STARTING ===")
+    # Fetch on-chain context once per pulse (shared across all pairs)
+    onchain_ctx = get_onchain_context()
     for pair in PAIRS:
-        analyse_pair(pair)
+        analyse_pair(pair, onchain_ctx)
+    logging.info("=== ANTAEUS v1.1 PULSE COMPLETE ===")
 
-    logging.info("=== ANTAEUS PULSE COMPLETE ===")
+# ── FLASK ENDPOINTS (v1.1 NEW) ────────────────────────────────────────────────
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok", "version": "1.1", "service": "ANTAEUS"})
 
-if __name__ == "__main__":
-    logging.info("ANTAEUS v1.0 ONLINE - MEAN REVERSION SPECIALIST")
-    self_heal_schema()
-    run_antaeus_pulse()
+@app.route('/signals')
+def signals():
+    """Return current mean reversion signals for all pairs."""
+    try:
+        conn = get_db()
+        if not conn: return jsonify({"error": "db"}), 500
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT ON (pair)
+                pair, signal_strength, reversion_prob,
+                composite_deviation, reversion_target,
+                reversion_direction, deviation_quality,
+                regime_compatible, timestamp
+            FROM antaeus_state
+            ORDER BY pair, timestamp DESC
+        """)
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+        result = {}
+        for row in rows:
+            result[row[0]] = {
+                "signal_strength":    row[1],
+                "reversion_prob":     round(row[2], 3),
+                "composite_deviation":round(row[3], 6),
+                "reversion_target":   row[4],
+                "direction":          row[5],
+                "quality":            row[6],
+                "regime_compatible":  row[7],
+                "timestamp":          str(row[8])
+            }
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ── MAIN LOOP — v1.1: heartbeat + Flask threading ─────────────────────────────
+def antaeus_loop():
+    cycle_count = 0
+    try:
+        run_antaeus_pulse(cycle_count)
+        write_heartbeat(cycle_count=cycle_count, status="alive")
+    except Exception as e:
+        logging.error(f"Initial pulse failed: {e}")
+        write_heartbeat(cycle_count=cycle_count, status="error", last_error=str(e))
     while True:
         time.sleep(ANTAEUS_INTERVAL)
-        run_antaeus_pulse()
+        cycle_count += 1
+        try:
+            run_antaeus_pulse(cycle_count)
+            write_heartbeat(cycle_count=cycle_count, status="alive")
+        except Exception as e:
+            logging.error(f"ANTAEUS loop error: {e}")
+            write_heartbeat(cycle_count=cycle_count, status="error", last_error=str(e))
+
+if __name__ == "__main__":
+    logging.info("ANTAEUS v1.1 ONLINE — MEAN REVERSION + OKX LIVE PRICES + CERBERUS + ON-CHAIN CONTEXT")
+    self_heal_schema()
+    t = threading.Thread(target=antaeus_loop, daemon=True)
+    t.start()
+    app.run(host='0.0.0.0', port=8080, debug=False)
